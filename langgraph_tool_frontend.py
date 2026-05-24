@@ -1,28 +1,46 @@
 import streamlit as st
-from langgraph_tool_backend import chatbot
+from langgraph_tool_backend import chatbot, retrieve_all_threads
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import uuid
 
-# ========================= UTILITIES =========================
-
+# =========================== Utilities ===========================
 def generate_thread_id():
-    return str(uuid.uuid4())
-
+    return uuid.uuid4()
 
 def reset_chat():
     thread_id = generate_thread_id()
-
     st.session_state["thread_id"] = thread_id
-    st.session_state["message_history"] = []
-    st.session_state["chat_threads"].append(thread_id)
-
-
-def clear_current_chat():
+    add_thread(thread_id)
     st.session_state["message_history"] = []
 
+def add_thread(thread_id):
+    if thread_id not in st.session_state["chat_threads"]:
+        st.session_state["chat_threads"].append(thread_id)
 
-# ========================= SESSION STATE =========================
+def get_thread_title(thread_id):
+    """Return a short human-readable title for a thread."""
+    # Return cached title if available
+    if thread_id in st.session_state.get("thread_titles", {}):
+        return st.session_state["thread_titles"][thread_id]
 
+    # Otherwise load from state and extract first human message
+    state = chatbot.get_state(config={"configurable": {"thread_id": thread_id}})
+    messages = state.values.get("messages", [])
+
+    for msg in messages:
+        if isinstance(msg, HumanMessage) and msg.content.strip():
+            title = msg.content.strip()[:40]
+            title = title + "…" if len(msg.content.strip()) > 40 else title
+            st.session_state["thread_titles"][thread_id] = title
+            return title
+
+    return "New Chat"
+
+def load_conversation(thread_id):
+    state = chatbot.get_state(config={"configurable": {"thread_id": thread_id}})
+    return state.values.get("messages", [])
+
+# ======================= Session Initialization ===================
 if "message_history" not in st.session_state:
     st.session_state["message_history"] = []
 
@@ -30,54 +48,58 @@ if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = generate_thread_id()
 
 if "chat_threads" not in st.session_state:
-    st.session_state["chat_threads"] = []
+    st.session_state["chat_threads"] = retrieve_all_threads()
 
-if st.session_state["thread_id"] not in st.session_state["chat_threads"]:
-    st.session_state["chat_threads"].append(
-        st.session_state["thread_id"]
-    )
+if "thread_titles" not in st.session_state:
+    st.session_state["thread_titles"] = {}
 
-# ========================= SIDEBAR =========================
+add_thread(st.session_state["thread_id"])
 
-st.sidebar.title("LangGraph AI Agent")
+# ============================ Sidebar ============================
+st.sidebar.title("LangGraph Chatbot")
 
-if st.sidebar.button("➕ New Chat"):
+if st.sidebar.button("New Chat"):
     reset_chat()
 
-if st.sidebar.button("🗑️ Clear Current Chat"):
-    clear_current_chat()
+st.sidebar.header("My Conversations")
 
-st.sidebar.markdown("---")
+for thread_id in st.session_state["chat_threads"][::-1]:
 
-st.sidebar.subheader("Conversations")
+    title = get_thread_title(thread_id)
 
-for idx, thread_id in enumerate(
-    reversed(st.session_state["chat_threads"])
-):
-
-    button_name = f"Chat {len(st.session_state['chat_threads']) - idx}"
-
-    if st.sidebar.button(button_name, key=thread_id):
+    if st.sidebar.button(title, key=str(thread_id)):
 
         st.session_state["thread_id"] = thread_id
-        st.session_state["message_history"] = []
+        messages = load_conversation(thread_id)
 
-# ========================= MAIN CHAT =========================
+        temp_messages = []
 
-st.title("🤖 LangGraph AI Agent")
+        for msg in messages:
 
-# Render previous messages
+            role = "user" if isinstance(msg, HumanMessage) else "assistant"
+
+            temp_messages.append(
+                {
+                    "role": role,
+                    "content": msg.content
+                }
+            )
+
+        st.session_state["message_history"] = temp_messages
+
+# ============================ Main UI ============================
+
+# Render history
 for message in st.session_state["message_history"]:
 
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        st.text(message["content"])
 
-# Chat input
-user_input = st.chat_input("Type your message...")
+user_input = st.chat_input("Type here")
 
 if user_input:
 
-    # Store user message
+    # Show user's message
     st.session_state["message_history"].append(
         {
             "role": "user",
@@ -85,17 +107,30 @@ if user_input:
         }
     )
 
-    # Render user message
     with st.chat_message("user"):
-        st.markdown(user_input)
+        st.text(user_input)
+
+    # Cache the title from the first message in this thread
+    thread_id = st.session_state["thread_id"]
+
+    if thread_id not in st.session_state["thread_titles"]:
+
+        title = user_input.strip()[:40]
+        title = title + "…" if len(user_input.strip()) > 40 else title
+
+        st.session_state["thread_titles"][thread_id] = title
 
     CONFIG = {
         "configurable": {
-            "thread_id": st.session_state["thread_id"]
-        }
+            "thread_id": thread_id
+        },
+        "metadata": {
+            "thread_id": thread_id
+        },
+        "run_name": "chat_turn",
     }
 
-    # Assistant response
+    # Assistant streaming block
     with st.chat_message("assistant"):
 
         status_holder = {"box": None}
@@ -103,42 +138,32 @@ if user_input:
         def ai_only_stream():
 
             for message_chunk, metadata in chatbot.stream(
-                {
-                    "messages": [
-                        HumanMessage(content=user_input)
-                    ]
-                },
+                {"messages": [HumanMessage(content=user_input)]},
                 config=CONFIG,
                 stream_mode="messages",
             ):
 
-                # Tool status
                 if isinstance(message_chunk, ToolMessage):
 
-                    tool_name = getattr(
-                        message_chunk,
-                        "name",
-                        "tool"
-                    )
+                    tool_name = getattr(message_chunk, "name", "tool")
 
                     if status_holder["box"] is None:
 
                         status_holder["box"] = st.status(
-                            f"🔧 Using `{tool_name}` ...",
+                            f"🔧 Using `{tool_name}` …",
                             expanded=True
                         )
 
                     else:
 
                         status_holder["box"].update(
-                            label=f"🔧 Using `{tool_name}` ...",
+                            label=f"🔧 Using `{tool_name}` …",
                             state="running",
                             expanded=True,
                         )
 
                     continue
 
-                # Stream only AI text
                 if isinstance(message_chunk, AIMessage):
 
                     content = message_chunk.content
@@ -147,24 +172,23 @@ if user_input:
 
                         cleaned = content.strip()
 
-                        if cleaned:
+                        # Prevent raw JSON/dict tool outputs
+                        if cleaned and not cleaned.startswith("{"):
                             yield cleaned
 
-        ai_response = st.write_stream(ai_only_stream())
+        ai_message = st.write_stream(ai_only_stream())
 
-        # Tool completion UI
         if status_holder["box"] is not None:
 
             status_holder["box"].update(
                 label="✅ Tool finished",
                 state="complete",
-                expanded=False,
+                expanded=False
             )
 
-    # Save assistant response
     st.session_state["message_history"].append(
         {
             "role": "assistant",
-            "content": ai_response
+            "content": ai_message
         }
     )
