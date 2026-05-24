@@ -1,45 +1,28 @@
 import streamlit as st
-from langgraph_tool_backend import chatbot, retrieve_all_threads
+from langgraph_tool_backend import chatbot
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 import uuid
 
-# =========================== Utilities ===========================
+# ========================= UTILITIES =========================
+
 def generate_thread_id():
-    return uuid.uuid4()
+    return str(uuid.uuid4())
+
 
 def reset_chat():
     thread_id = generate_thread_id()
+
     st.session_state["thread_id"] = thread_id
-    add_thread(thread_id)
+    st.session_state["message_history"] = []
+    st.session_state["chat_threads"].append(thread_id)
+
+
+def clear_current_chat():
     st.session_state["message_history"] = []
 
-def add_thread(thread_id):
-    if thread_id not in st.session_state["chat_threads"]:
-        st.session_state["chat_threads"].append(thread_id)
 
-def get_thread_title(thread_id):
-    """Return a short human-readable title for a thread."""
-    # Return cached title if available
-    if thread_id in st.session_state.get("thread_titles", {}):
-        return st.session_state["thread_titles"][thread_id]
+# ========================= SESSION STATE =========================
 
-    # Otherwise load from state and extract first human message
-    state = chatbot.get_state(config={"configurable": {"thread_id": thread_id}})
-    messages = state.values.get("messages", [])
-    for msg in messages:
-        if isinstance(msg, HumanMessage) and msg.content.strip():
-            title = msg.content.strip()[:40]
-            title = title + "…" if len(msg.content.strip()) > 40 else title
-            st.session_state["thread_titles"][thread_id] = title
-            return title
-
-    return "New Chat"
-
-def load_conversation(thread_id):
-    state = chatbot.get_state(config={"configurable": {"thread_id": thread_id}})
-    return state.values.get("messages", [])
-
-# ======================= Session Initialization ===================
 if "message_history" not in st.session_state:
     st.session_state["message_history"] = []
 
@@ -47,97 +30,141 @@ if "thread_id" not in st.session_state:
     st.session_state["thread_id"] = generate_thread_id()
 
 if "chat_threads" not in st.session_state:
-    st.session_state["chat_threads"] = retrieve_all_threads()
+    st.session_state["chat_threads"] = []
 
-if "thread_titles" not in st.session_state:
-    st.session_state["thread_titles"] = {}
+if st.session_state["thread_id"] not in st.session_state["chat_threads"]:
+    st.session_state["chat_threads"].append(
+        st.session_state["thread_id"]
+    )
 
-add_thread(st.session_state["thread_id"])
+# ========================= SIDEBAR =========================
 
-# ============================ Sidebar ============================
-st.sidebar.title("LangGraph Chatbot")
+st.sidebar.title("LangGraph AI Agent")
 
-if st.sidebar.button("New Chat"):
+if st.sidebar.button("➕ New Chat"):
     reset_chat()
 
-st.sidebar.header("My Conversations")
-for thread_id in st.session_state["chat_threads"][::-1]:
-    title = get_thread_title(thread_id)
-    if st.sidebar.button(title, key=str(thread_id)):
+if st.sidebar.button("🗑️ Clear Current Chat"):
+    clear_current_chat()
+
+st.sidebar.markdown("---")
+
+st.sidebar.subheader("Conversations")
+
+for idx, thread_id in enumerate(
+    reversed(st.session_state["chat_threads"])
+):
+
+    button_name = f"Chat {len(st.session_state['chat_threads']) - idx}"
+
+    if st.sidebar.button(button_name, key=thread_id):
+
         st.session_state["thread_id"] = thread_id
-        messages = load_conversation(thread_id)
+        st.session_state["message_history"] = []
 
-        temp_messages = []
-        for msg in messages:
-            role = "user" if isinstance(msg, HumanMessage) else "assistant"
-            temp_messages.append({"role": role, "content": msg.content})
-        st.session_state["message_history"] = temp_messages
+# ========================= MAIN CHAT =========================
 
-# ============================ Main UI ============================
+st.title("🤖 LangGraph AI Agent")
 
-# Render history
+# Render previous messages
 for message in st.session_state["message_history"]:
-    with st.chat_message(message["role"]):
-        st.text(message["content"])
 
-user_input = st.chat_input("Type here")
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# Chat input
+user_input = st.chat_input("Type your message...")
 
 if user_input:
-    # Show user's message
-    st.session_state["message_history"].append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.text(user_input)
 
-    # Cache the title from the first message in this thread
-    thread_id = st.session_state["thread_id"]
-    if thread_id not in st.session_state["thread_titles"]:
-        title = user_input.strip()[:40]
-        title = title + "…" if len(user_input.strip()) > 40 else title
-        st.session_state["thread_titles"][thread_id] = title
+    # Store user message
+    st.session_state["message_history"].append(
+        {
+            "role": "user",
+            "content": user_input
+        }
+    )
+
+    # Render user message
+    with st.chat_message("user"):
+        st.markdown(user_input)
 
     CONFIG = {
-        "configurable": {"thread_id": thread_id},
-        "metadata": {"thread_id": thread_id},
-        "run_name": "chat_turn",
+        "configurable": {
+            "thread_id": st.session_state["thread_id"]
+        }
     }
 
-    # Assistant streaming block
+    # Assistant response
     with st.chat_message("assistant"):
+
         status_holder = {"box": None}
 
         def ai_only_stream():
+
             for message_chunk, metadata in chatbot.stream(
-                {"messages": [HumanMessage(content=user_input)]},
+                {
+                    "messages": [
+                        HumanMessage(content=user_input)
+                    ]
+                },
                 config=CONFIG,
                 stream_mode="messages",
             ):
+
+                # Tool status
                 if isinstance(message_chunk, ToolMessage):
-                    tool_name = getattr(message_chunk, "name", "tool")
+
+                    tool_name = getattr(
+                        message_chunk,
+                        "name",
+                        "tool"
+                    )
+
                     if status_holder["box"] is None:
+
                         status_holder["box"] = st.status(
-                            f"🔧 Using `{tool_name}` …", expanded=True
+                            f"🔧 Using `{tool_name}` ...",
+                            expanded=True
                         )
+
                     else:
+
                         status_holder["box"].update(
-                            label=f"🔧 Using `{tool_name}` …",
+                            label=f"🔧 Using `{tool_name}` ...",
                             state="running",
                             expanded=True,
                         )
 
+                    continue
+
+                # Stream only AI text
                 if isinstance(message_chunk, AIMessage):
 
                     content = message_chunk.content
 
-                    if isinstance(content, str) and content.strip():
-                        yield content
+                    if isinstance(content, str):
 
-        ai_message = st.write_stream(ai_only_stream())
+                        cleaned = content.strip()
 
+                        if cleaned:
+                            yield cleaned
+
+        ai_response = st.write_stream(ai_only_stream())
+
+        # Tool completion UI
         if status_holder["box"] is not None:
+
             status_holder["box"].update(
-                label="✅ Tool finished", state="complete", expanded=False
+                label="✅ Tool finished",
+                state="complete",
+                expanded=False,
             )
 
+    # Save assistant response
     st.session_state["message_history"].append(
-        {"role": "assistant", "content": ai_message}
+        {
+            "role": "assistant",
+            "content": ai_response
+        }
     )
