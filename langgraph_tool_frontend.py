@@ -125,7 +125,11 @@ if user_input:
                         )
 
                 if isinstance(message_chunk, AIMessage):
-                    yield message_chunk.content
+
+                    content = message_chunk.content
+
+                    if isinstance(content, str) and content.strip():
+                        yield content
 
         ai_message = st.write_stream(ai_only_stream())
 
